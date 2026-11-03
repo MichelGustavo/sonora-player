@@ -12,8 +12,19 @@ Player de música desktop em Python, com interface escura e minimalista.
 - Modos de repetição: desligado, repetir fila e repetir faixa atual.
 - Editor de metadados: título, artista, álbum, artista do álbum, ano/data, número da faixa e gênero.
 - Opção de incorporar uma nova capa ao arquivo (formatos compatíveis).
-- Atalhos: `Ctrl+O` abre pasta, `Ctrl+E` edita a faixa selecionada e `Espaço` reproduz/pausa.
+- Atalhos: `Ctrl+O` abre pasta, `Ctrl+E` edita a faixa selecionada, `Ctrl+F` foca a busca e `Espaço` reproduz/pausa.
 - Última pasta selecionada salva nas configurações do aplicativo.
+
+## Interface
+
+- Tema escuro com cor de destaque própria (coral), tipografia e alturas padronizadas.
+- Ícones desenhados em código, alinhados e com estados de hover, ativo e desativado consistentes.
+- Barra do player em três zonas: faixa atual (esquerda), controles e progresso (centro) e volume (direita).
+  Clique na barra de progresso ou de volume para saltar direto à posição; o ícone de volume silencia/reativa o som.
+- Cartões de álbum que se reorganizam e se ajustam à largura da janela; tamanho mínimo da janela: 900 × 620.
+- A faixa em reprodução fica destacada nas tabelas; estados vazios e de "sem resultados" nas buscas.
+- Falhas de leitura de arquivos, de gravação de tags/capa e de reprodução são mostradas de forma explícita
+  (aviso discreto sobre o player ou diálogo com detalhes), nunca como sucesso.
 
 ## Instalação
 

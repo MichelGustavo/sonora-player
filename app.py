@@ -18,6 +18,7 @@ from PySide6.QtGui import (
     QAction,
     QBrush,
     QColor,
+    QCursor,
     QIcon,
     QImage,
     QKeySequence,
@@ -367,6 +368,11 @@ QPushButton#ghostButton {
     background: transparent; border: 0; color: @text2; padding: 0 12px 0 6px; min-height: 32px;
 }
 QPushButton#ghostButton:hover { background: @surface2; color: @text; }
+QPushButton#rowEditButton {
+    background: @surface2; color: @text; border: 0; border-radius: 15px;
+    padding: 0; min-width: 30px; max-width: 30px; min-height: 30px; max-height: 30px;
+}
+QPushButton#rowEditButton:hover { background: @accent; color: @onAccent; }
 
 /* Campos */
 QLineEdit {
@@ -1323,15 +1329,6 @@ class SonoraWindow(QMainWindow):
         self.search.textChanged.connect(self.filter_content)
         top.addWidget(self.search, 1, Qt.AlignVCenter)
 
-        self.edit_button = QPushButton("Editar")
-        self.edit_button.setIcon(make_icon("edit", PALETTE["text"], 18))
-        self.edit_button.setFixedHeight(40)
-        self.edit_button.setCursor(Qt.PointingHandCursor)
-        self.edit_button.setFocusPolicy(Qt.NoFocus)
-        self.edit_button.setToolTip("Editar metadados da faixa selecionada (Ctrl+E)")
-        self.edit_button.setEnabled(False)
-        self.edit_button.clicked.connect(self.edit_selected_track)
-        top.addWidget(self.edit_button, 0, Qt.AlignVCenter)
         return top
 
     def _make_empty_page(self) -> QWidget:
@@ -1343,8 +1340,8 @@ class SonoraWindow(QMainWindow):
         )
 
     def _new_track_table(self) -> QTableWidget:
-        table = QTableWidget(0, 4)
-        table.setHorizontalHeaderLabels(["TÍTULO", "ARTISTA", "ÁLBUM", "DURAÇÃO"])
+        table = QTableWidget(0, 5)
+        table.setHorizontalHeaderLabels(["TÍTULO", "ARTISTA", "ÁLBUM", "DURAÇÃO", ""])
         table.verticalHeader().setVisible(False)
         table.setShowGrid(False)
         table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -1356,6 +1353,9 @@ class SonoraWindow(QMainWindow):
         table.setWordWrap(False)
         table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        table.setMouseTracking(True)
+        table.viewport().setMouseTracking(True)
+        table.viewport().installEventFilter(self)
         header = table.horizontalHeader()
         header.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         header.setSectionsClickable(False)
@@ -1365,14 +1365,39 @@ class SonoraWindow(QMainWindow):
         for column in (0, 1, 2):
             header.setSectionResizeMode(column, QHeaderView.Stretch)
         header.setSectionResizeMode(3, QHeaderView.Fixed)
+        header.setSectionResizeMode(4, QHeaderView.Fixed)
         table.setColumnWidth(3, 96)
+        table.setColumnWidth(4, 40)
         table.horizontalHeaderItem(3).setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
         table.verticalHeader().setDefaultSectionSize(48)
         table.tracks = []
+        table.edit_buttons = []
+        table.cellEntered.connect(lambda row, _column, t=table: self._show_row_edit_button(t, row))
         table.cellDoubleClicked.connect(lambda row, _col, t=table: self.play_table_row(t, row))
-        table.itemSelectionChanged.connect(self.on_table_selection_changed)
         table.customContextMenuRequested.connect(lambda pos, t=table: self.show_track_context_menu(t, pos))
         return table
+
+    def _show_row_edit_button(self, table: QTableWidget, row: int):
+        for index, button in enumerate(table.edit_buttons):
+            button.setVisible(index == row)
+
+    def _hide_row_edit_buttons(self, table: QTableWidget):
+        for button in table.edit_buttons:
+            button.hide()
+
+    def _sync_hovered_edit_button(self, table: QTableWidget):
+        point = table.viewport().mapFromGlobal(QCursor.pos())
+        row = table.rowAt(point.y()) if table.viewport().rect().contains(point) else -1
+        if row >= 0:
+            self._show_row_edit_button(table, row)
+        else:
+            self._hide_row_edit_buttons(table)
+
+    def _edit_table_row(self, table: QTableWidget, row: int):
+        tracks = getattr(table, "tracks", [])
+        if 0 <= row < len(tracks):
+            table.selectRow(row)
+            self.edit_track(tracks[row])
 
     def _make_tracks_page(self):
         page = QWidget()
@@ -1740,6 +1765,7 @@ class SonoraWindow(QMainWindow):
             table.clearContents()
             table.setRowCount(len(tracks))
             table.tracks = tracks
+            table.edit_buttons = []
             for row, track in enumerate(tracks):
                 title_item = QTableWidgetItem(track.title)
                 title_item.setData(Qt.UserRole, track.path)
@@ -1755,6 +1781,16 @@ class SonoraWindow(QMainWindow):
                 table.setItem(row, 1, artist_item)
                 table.setItem(row, 2, album_item)
                 table.setItem(row, 3, duration_item)
+                edit_button = QPushButton()
+                edit_button.setObjectName("rowEditButton")
+                edit_button.setIcon(make_icon("edit", PALETTE["text"], 16))
+                edit_button.setCursor(Qt.PointingHandCursor)
+                edit_button.setFocusPolicy(Qt.NoFocus)
+                edit_button.setToolTip(f"Editar metadados de {track.title}")
+                edit_button.clicked.connect(lambda _checked=False, t=table, r=row: self._edit_table_row(t, r))
+                table.setCellWidget(row, 4, edit_button)
+                edit_button.hide()
+                table.edit_buttons.append(edit_button)
             self._mark_playing(table)
         finally:
             table.setUpdatesEnabled(True)
@@ -1827,6 +1863,14 @@ class SonoraWindow(QMainWindow):
         scroll = getattr(self, "albums_scroll", None)
         if scroll is not None and obj is scroll.viewport() and event.type() == QEvent.Type.Resize:
             QTimer.singleShot(0, self._layout_albums)
+        if event.type() in (QEvent.Type.Show, QEvent.Type.Leave):
+            for table in (getattr(self, "track_table", None), getattr(self, "detail_table", None)):
+                if table is not None and obj is table.viewport():
+                    if event.type() == QEvent.Type.Show:
+                        QTimer.singleShot(0, lambda t=table: self._sync_hovered_edit_button(t))
+                    else:
+                        self._hide_row_edit_buttons(table)
+                    break
         return super().eventFilter(obj, event)
 
     def resizeEvent(self, event):  # noqa: N802
@@ -1862,7 +1906,6 @@ class SonoraWindow(QMainWindow):
                 query in value.casefold() for value in (t.title, t.artist, t.album, t.genre)
             )]
             self._populate_tracks(self.detail_table, filtered_album)
-        self.on_table_selection_changed()
 
     def show_page(self, page: str):
         if page == "tracks":
@@ -1883,7 +1926,6 @@ class SonoraWindow(QMainWindow):
             self._populate_albums()
             QTimer.singleShot(0, self._layout_albums)
         self._update_nav(page)
-        self.on_table_selection_changed()
 
     def _update_nav(self, active: str):
         self.nav_tracks.set_active(active == "tracks")
@@ -1909,7 +1951,6 @@ class SonoraWindow(QMainWindow):
         self._populate_tracks(self.detail_table, tracks)
         self.pages.setCurrentWidget(self.album_detail_page)
         self._update_nav("albums")
-        self.on_table_selection_changed()
 
     # ----- Seleção, contexto e edição -----
     def play_table_row(self, table: QTableWidget, row: int):
@@ -1928,9 +1969,6 @@ class SonoraWindow(QMainWindow):
         row = table.currentRow()
         tracks = getattr(table, "tracks", [])
         return tracks[row] if 0 <= row < len(tracks) else None
-
-    def on_table_selection_changed(self):
-        self.edit_button.setEnabled(self.selected_track() is not None)
 
     def show_track_context_menu(self, table: QTableWidget, pos):
         row = table.rowAt(pos.y())

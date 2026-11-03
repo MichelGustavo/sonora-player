@@ -10,10 +10,10 @@ from typing import Callable, Optional
 
 from mutagen import File as MutagenFile
 from mutagen.flac import Picture
-from mutagen.id3 import APIC
+from mutagen.id3 import APIC, TRCK
 from mutagen.mp4 import MP4Cover
 
-from PySide6.QtCore import QEvent, QPointF, QRectF, QSettings, QSize, Qt, QTimer, QUrl
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, QSettings, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QAction,
     QBrush,
@@ -88,6 +88,145 @@ class Track:
     @property
     def display_album(self) -> str:
         return self.album or "Álbum desconhecido"
+
+
+class TrackTable(QTableWidget):
+    rowsReordered = Signal(list)
+    reorderFeedback = Signal(str, bool)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._drag_row = -1
+        self._drop_index = -1
+        self.reorder_enabled = False
+
+    def begin_reorder(self, row: int):
+        if not self.reorder_enabled or not 0 <= row < len(self.tracks):
+            return
+        self._drag_row = row
+        self._drop_index = row
+        self.setCursor(Qt.ClosedHandCursor)
+        self.reorderFeedback.emit(f'Movendo “{self.tracks[row].title}” — arraste para a nova posição.', True)
+        self.viewport().update()
+
+    def update_reorder(self, y: int):
+        if self._drag_row < 0:
+            return
+        target_row = self.rowAt(y)
+        if target_row < 0:
+            self._drop_index = 0 if y < 0 else len(self.tracks)
+        else:
+            rect = self.visualItemRect(self.item(target_row, 0))
+            self._drop_index = target_row + (y >= rect.center().y())
+        self._drop_index = max(0, min(self._drop_index, len(self.tracks)))
+        self.viewport().update()
+
+        if self._drop_index in (self._drag_row, self._drag_row + 1):
+            destination = "A faixa permanecerá nesta posição."
+        elif self._drop_index == len(self.tracks):
+            destination = "no final do álbum"
+        else:
+            destination = f'antes de “{self.tracks[self._drop_index].title}”'
+        self.reorderFeedback.emit(f'Solte para colocar “{self.tracks[self._drag_row].title}” {destination}.', True)
+
+    def finish_reorder(self, y: int):
+        if self._drag_row < 0:
+            return
+        self.update_reorder(y)
+        source_row = self._drag_row
+        target_index = self._drop_index
+        self._drag_row = -1
+        self._drop_index = -1
+        self.setCursor(Qt.OpenHandCursor if self.reorder_enabled else Qt.ArrowCursor)
+        self.viewport().update()
+        self.reorderFeedback.emit("", False)
+
+        if target_index < 0 or target_index in (source_row, source_row + 1):
+            return
+        ordered_tracks = list(self.tracks)
+        moved_track = ordered_tracks.pop(source_row)
+        if target_index > source_row:
+            target_index -= 1
+        ordered_tracks.insert(target_index, moved_track)
+        self.rowsReordered.emit([track.path for track in ordered_tracks])
+
+    def paintEvent(self, event):  # noqa: N802
+        super().paintEvent(event)
+        if self._drag_row < 0 or self._drop_index < 0:
+            return
+        painter = QPainter(self.viewport())
+        source_item = self.item(self._drag_row, 0)
+        if source_item is not None:
+            source_rect = self.visualItemRect(source_item)
+            source_fill = QColor(PALETTE["accent"])
+            source_fill.setAlpha(38)
+            painter.fillRect(
+                QRectF(0, source_rect.top(), self.viewport().width(), source_rect.height()),
+                source_fill,
+            )
+        if self._drop_index == self.rowCount():
+            y = self.visualItemRect(self.item(self.rowCount() - 1, 0)).bottom() + 1 if self.rowCount() else 0
+        else:
+            y = self.visualItemRect(self.item(self._drop_index, 0)).top()
+        painter.setPen(QPen(qcolor("accent"), 3))
+        painter.drawLine(0, y, self.viewport().width(), y)
+        painter.end()
+
+
+class TrackDragHandle(QPushButton):
+    dragStarted = Signal(int)
+    dragMoved = Signal(int)
+    dragFinished = Signal(int)
+
+    def __init__(self, table: TrackTable, row: int):
+        super().__init__()
+        self._table = table
+        self._row = row
+        self._press_position = QPoint()
+        self._drag_active = False
+        self.setObjectName("rowDragHandle")
+        self.setIcon(make_icon("drag", PALETTE["text2"], 18))
+        self.setCursor(Qt.OpenHandCursor)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setToolTip("Arraste esta alça para mudar a posição da faixa")
+        self.setAccessibleName(f"Reordenar faixa {row + 1}")
+
+    def mousePressEvent(self, event):  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            self._press_position = event.globalPosition().toPoint()
+            self._drag_active = False
+            self.setDown(True)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):  # noqa: N802
+        if event.buttons() & Qt.LeftButton:
+            position = event.globalPosition().toPoint()
+            if not self._drag_active and (
+                position - self._press_position
+            ).manhattanLength() >= QApplication.startDragDistance():
+                self._drag_active = True
+                self.setCursor(Qt.ClosedHandCursor)
+                self.dragStarted.emit(self._row)
+            if self._drag_active:
+                viewport_position = self.mapTo(self._table.viewport(), event.position().toPoint())
+                self.dragMoved.emit(viewport_position.y())
+                event.accept()
+                return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            if self._drag_active:
+                viewport_position = self.mapTo(self._table.viewport(), event.position().toPoint())
+                self.dragFinished.emit(viewport_position.y())
+            self._drag_active = False
+            self.setDown(False)
+            self.setCursor(Qt.OpenHandCursor)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 
 # ---------- Leitura e gravação de metadados ----------
@@ -221,6 +360,37 @@ def save_tags(track_path: str, values: dict[str, str], cover_path: Optional[str]
             ) from exc
 
 
+def save_track_number(track_path: str, track_number: str) -> None:
+    audio = MutagenFile(track_path)
+    if audio is None:
+        raise RuntimeError("Este formato de arquivo não permite edição de metadados pelo SONORA.")
+    try:
+        if hasattr(audio.tags, "getall") or Path(track_path).suffix.lower() in {
+            ".mp3", ".wav", ".aiff", ".aif",
+        }:
+            if audio.tags is None:
+                audio.add_tags()
+            audio.tags.delall("TRCK")
+            if track_number:
+                audio.tags.add(TRCK(encoding=3, text=track_number))
+        else:
+            audio = MutagenFile(track_path, easy=True)
+            if audio is None:
+                raise RuntimeError("Não foi possível reabrir o arquivo para editar os metadados.")
+            if audio.tags is None:
+                audio.add_tags()
+                audio = MutagenFile(track_path, easy=True)
+                if audio is None or audio.tags is None:
+                    raise RuntimeError("Não foi possível inicializar os metadados deste arquivo.")
+            if track_number:
+                audio.tags["tracknumber"] = [track_number]
+            elif "tracknumber" in audio.tags:
+                del audio.tags["tracknumber"]
+        audio.save()
+    except Exception as exc:
+        raise RuntimeError(f"Não foi possível gravar o número da faixa: {exc}") from exc
+
+
 def _embed_cover(track_path: str, cover_path: str) -> None:
     image_data = Path(cover_path).read_bytes()
     mime = mimetypes.guess_type(cover_path)[0] or "image/jpeg"
@@ -322,6 +492,8 @@ QLabel#tagline { color: @text3; font-size: 10px; }
 QLabel#emptyTitle { font-size: 22px; font-weight: 800; }
 QLabel#emptyText { color: @text2; font-size: 13px; }
 QLabel#countLabel { color: @text2; font-size: 12px; }
+QLabel#reorderHint { color: @text2; font-size: 12px; padding: 4px 0; }
+QLabel#reorderHint[active="true"] { color: @accent; font-weight: 700; }
 QLabel#subtle { color: @text3; font-size: 11px; }
 QLabel#cardTitle { font-size: 13px; font-weight: 700; }
 QLabel#cardSub { color: @text2; font-size: 12px; }
@@ -373,6 +545,12 @@ QPushButton#rowEditButton {
     padding: 0; min-width: 30px; max-width: 30px; min-height: 30px; max-height: 30px;
 }
 QPushButton#rowEditButton:hover { background: @accent; color: @onAccent; }
+QPushButton#rowDragHandle {
+    background: transparent; color: @text2; border: 1px solid transparent; border-radius: 9px;
+    padding: 0; min-width: 32px; max-width: 32px; min-height: 32px; max-height: 32px;
+}
+QPushButton#rowDragHandle:hover { background: @surface2; border-color: @borderStrong; }
+QPushButton#rowDragHandle:pressed { background: @selected; border-color: @accent; }
 
 /* Campos */
 QLineEdit {
@@ -627,6 +805,12 @@ def draw_icon(painter: QPainter, name: str, rect: QRectF, color: QColor) -> None
         painter.setBrush(Qt.NoBrush)
         painter.drawPolygon(_poly((4.5, 19.5), (5.4, 14.8), (15.8, 4.4), (19.6, 8.2), (9.2, 18.6)))
         painter.drawLine(QPointF(13.6, 6.6), QPointF(17.4, 10.4))
+    elif name == "drag":
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(fill)
+        for x in (8, 16):
+            for y in (6, 12, 18):
+                painter.drawEllipse(QPointF(x, y), 1.5, 1.5)
     elif name == "back":
         painter.setPen(stroke)
         painter.setBrush(Qt.NoBrush)
@@ -1340,8 +1524,8 @@ class SonoraWindow(QMainWindow):
         )
 
     def _new_track_table(self) -> QTableWidget:
-        table = QTableWidget(0, 5)
-        table.setHorizontalHeaderLabels(["TÍTULO", "ARTISTA", "ÁLBUM", "DURAÇÃO", ""])
+        table = TrackTable(0, 7)
+        table.setHorizontalHeaderLabels(["Nº", "TÍTULO", "ARTISTA", "ÁLBUM", "DURAÇÃO", "", ""])
         table.verticalHeader().setVisible(False)
         table.setShowGrid(False)
         table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -1356,23 +1540,34 @@ class SonoraWindow(QMainWindow):
         table.setMouseTracking(True)
         table.viewport().setMouseTracking(True)
         table.viewport().installEventFilter(self)
+        table.setDragDropMode(QAbstractItemView.NoDragDrop)
+        table.setCursor(Qt.ArrowCursor)
         header = table.horizontalHeader()
         header.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         header.setSectionsClickable(False)
         header.setHighlightSections(False)
         header.setStretchLastSection(False)
         header.setMinimumSectionSize(80)
-        for column in (0, 1, 2):
+        header.setSectionResizeMode(0, QHeaderView.Fixed)
+        for column in (1, 2, 3):
             header.setSectionResizeMode(column, QHeaderView.Stretch)
-        header.setSectionResizeMode(3, QHeaderView.Fixed)
         header.setSectionResizeMode(4, QHeaderView.Fixed)
-        table.setColumnWidth(3, 96)
-        table.setColumnWidth(4, 40)
-        table.horizontalHeaderItem(3).setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        header.setSectionResizeMode(5, QHeaderView.Fixed)
+        header.setSectionResizeMode(6, QHeaderView.Fixed)
+        table.setColumnWidth(0, 56)
+        table.setColumnWidth(4, 96)
+        table.setColumnWidth(5, 40)
+        table.setColumnWidth(6, 40)
+        table.horizontalHeaderItem(0).setTextAlignment(Qt.AlignCenter)
+        table.horizontalHeaderItem(4).setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        table.horizontalHeaderItem(6).setToolTip("Arraste a alça para reorganizar as faixas")
         table.verticalHeader().setDefaultSectionSize(48)
         table.tracks = []
         table.edit_buttons = []
+        table.drag_handles = []
         table.cellEntered.connect(lambda row, _column, t=table: self._show_row_edit_button(t, row))
+        table.rowsReordered.connect(lambda paths, t=table: self._handle_album_reorder(t, paths))
+        table.reorderFeedback.connect(self._set_reorder_hint)
         table.cellDoubleClicked.connect(lambda row, _col, t=table: self.play_table_row(t, row))
         table.customContextMenuRequested.connect(lambda pos, t=table: self.show_track_context_menu(t, pos))
         return table
@@ -1384,6 +1579,14 @@ class SonoraWindow(QMainWindow):
     def _hide_row_edit_buttons(self, table: QTableWidget):
         for button in table.edit_buttons:
             button.hide()
+
+    def _set_reorder_hint(self, text: str, active: bool):
+        if not text:
+            text = "Use a alça ⋮ à direita de uma faixa para reorganizar o álbum."
+        self.reorder_hint.setText(text)
+        self.reorder_hint.setProperty("active", active)
+        self.reorder_hint.style().unpolish(self.reorder_hint)
+        self.reorder_hint.style().polish(self.reorder_hint)
 
     def _sync_hovered_edit_button(self, table: QTableWidget):
         point = table.viewport().mapFromGlobal(QCursor.pos())
@@ -1497,6 +1700,9 @@ class SonoraWindow(QMainWindow):
         hero.addLayout(info, 1)
         layout.addLayout(hero)
         layout.addSpacing(6)
+        self.reorder_hint = QLabel("Use a alça ⋮ à direita de uma faixa para reorganizar o álbum.")
+        self.reorder_hint.setObjectName("reorderHint")
+        layout.addWidget(self.reorder_hint)
         self.detail_table = self._new_track_table()
         layout.addWidget(self.detail_table, 1)
         return page
@@ -1766,7 +1972,27 @@ class SonoraWindow(QMainWindow):
             table.setRowCount(len(tracks))
             table.tracks = tracks
             table.edit_buttons = []
+            table.drag_handles = []
+            is_album_table = table is getattr(self, "detail_table", None)
+            discs = {track.disc_number.strip() for track in tracks}
+            can_reorder = is_album_table and len(discs) <= 1 and not self.search.text().strip()
+            table.reorder_enabled = can_reorder
+            table.setCursor(Qt.ArrowCursor)
+            if is_album_table and hasattr(self, "reorder_hint"):
+                if can_reorder:
+                    self._set_reorder_hint(
+                        "Use a alça ⋮ à direita de uma faixa para reorganizar o álbum.", False
+                    )
+                elif self.search.text().strip():
+                    self._set_reorder_hint("Limpe a busca para reorganizar as faixas.", False)
+                else:
+                    self._set_reorder_hint(
+                        "A reordenação está disponível apenas para álbuns de um único disco.", False
+                    )
             for row, track in enumerate(tracks):
+                number_item = QTableWidgetItem(track.track_number.split("/")[0] or "—")
+                number_item.setTextAlignment(Qt.AlignCenter)
+                number_item.setForeground(QBrush(qcolor("text2")))
                 title_item = QTableWidgetItem(track.title)
                 title_item.setData(Qt.UserRole, track.path)
                 title_item.setToolTip(track.path)
@@ -1777,10 +2003,15 @@ class SonoraWindow(QMainWindow):
                 duration_item = QTableWidgetItem(format_time(track.duration))
                 duration_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 duration_item.setForeground(QBrush(qcolor("text2")))
-                table.setItem(row, 0, title_item)
-                table.setItem(row, 1, artist_item)
-                table.setItem(row, 2, album_item)
-                table.setItem(row, 3, duration_item)
+                table.setItem(row, 0, number_item)
+                table.setItem(row, 1, title_item)
+                table.setItem(row, 2, artist_item)
+                table.setItem(row, 3, album_item)
+                table.setItem(row, 4, duration_item)
+                edit_cell = QWidget()
+                edit_layout = QHBoxLayout(edit_cell)
+                edit_layout.setContentsMargins(0, 0, 0, 0)
+                edit_layout.setAlignment(Qt.AlignCenter)
                 edit_button = QPushButton()
                 edit_button.setObjectName("rowEditButton")
                 edit_button.setIcon(make_icon("edit", PALETTE["text"], 16))
@@ -1788,12 +2019,79 @@ class SonoraWindow(QMainWindow):
                 edit_button.setFocusPolicy(Qt.NoFocus)
                 edit_button.setToolTip(f"Editar metadados de {track.title}")
                 edit_button.clicked.connect(lambda _checked=False, t=table, r=row: self._edit_table_row(t, r))
-                table.setCellWidget(row, 4, edit_button)
+                edit_layout.addWidget(edit_button)
+                table.setCellWidget(row, 5, edit_cell)
                 edit_button.hide()
                 table.edit_buttons.append(edit_button)
+                drag_cell = QWidget()
+                drag_layout = QHBoxLayout(drag_cell)
+                drag_layout.setContentsMargins(0, 0, 0, 0)
+                drag_layout.setAlignment(Qt.AlignCenter)
+                drag_handle = TrackDragHandle(table, row)
+                drag_handle.setVisible(can_reorder)
+                drag_handle.setToolTip(f"Arraste para reordenar “{track.title}”")
+                drag_handle.setAccessibleName(f"Reordenar faixa {row + 1}: {track.title}")
+                drag_handle.dragStarted.connect(table.begin_reorder)
+                drag_handle.dragMoved.connect(table.update_reorder)
+                drag_handle.dragFinished.connect(table.finish_reorder)
+                drag_layout.addWidget(drag_handle)
+                table.setCellWidget(row, 6, drag_cell)
+                table.drag_handles.append(drag_handle)
             self._mark_playing(table)
         finally:
             table.setUpdatesEnabled(True)
+
+    def _handle_album_reorder(self, table: QTableWidget, ordered_paths: Optional[list[str]] = None):
+        if table is not self.detail_table or not self.current_album:
+            return
+        tracks_by_path = {track.path: track for track in self.current_album["tracks"]}
+        if ordered_paths is None:
+            ordered_paths = [
+                table.item(row, 1).data(Qt.UserRole) if table.item(row, 1) else None
+                for row in range(table.rowCount())
+            ]
+        if len(ordered_paths) != len(tracks_by_path) or any(path not in tracks_by_path for path in ordered_paths):
+            self._populate_tracks(table, self.current_album["tracks"])
+            return
+
+        ordered_tracks = [tracks_by_path[path] for path in ordered_paths]
+        old_numbers = {track.path: track.track_number for track in ordered_tracks}
+        has_totals = any("/" in number for number in old_numbers.values())
+        changed: list[Track] = []
+        try:
+            for index, track in enumerate(ordered_tracks, start=1):
+                new_number = f"{index}/{len(ordered_tracks)}" if has_totals else str(index)
+                if new_number == track.track_number:
+                    continue
+                changed.append(track)
+                save_track_number(track.path, new_number)
+        except Exception as exc:
+            rollback_errors = []
+            for track in reversed(changed):
+                try:
+                    save_track_number(track.path, old_numbers[track.path])
+                except Exception as rollback_exc:
+                    rollback_errors.append(f"{Path(track.path).name}: {rollback_exc}")
+            self._populate_tracks(table, self.current_album["tracks"])
+            message = f"Não foi possível salvar a nova ordem: {exc}"
+            if rollback_errors:
+                message += "\nFalha ao restaurar: " + "; ".join(rollback_errors)
+            self.show_message("error", "Ordem não salva", message)
+            return
+
+        for index, track in enumerate(ordered_tracks, start=1):
+            track.track_number = f"{index}/{len(ordered_tracks)}" if has_totals else str(index)
+        self.all_tracks.sort(key=self.track_sort_key)
+        self._group_albums()
+        album_paths = {track.path for track in ordered_tracks}
+        self.current_album = next(
+            album for album in self.albums
+            if album_paths == {track.path for track in album["tracks"]}
+        )
+        self._populate_tracks(self.track_table, self.all_tracks)
+        self._populate_albums()
+        self._populate_tracks(table, self.current_album["tracks"])
+        self.notify("Nova ordem do álbum salva nos arquivos de música.")
 
     def _mark_playing(self, table: Optional[QTableWidget] = None):
         """Destaca em cor de acento a faixa que está tocando."""
@@ -1801,7 +2099,7 @@ class SonoraWindow(QMainWindow):
         tables = (table,) if table is not None else (self.track_table, self.detail_table)
         for current in tables:
             for row, track in enumerate(getattr(current, "tracks", [])):
-                item = current.item(row, 0)
+                item = current.item(row, 1)
                 if item is None:
                     continue
                 playing = track.path == path

@@ -8,6 +8,7 @@ Player de música desktop em Python, com interface escura e minimalista.
 - Biblioteca de faixas e seção exclusiva de álbuns.
 - Agrupamento por **artista do álbum + álbum**, usando metadados.
 - Capa incorporada ao arquivo exibida no player e nos cartões de álbum.
+- Reordenação de faixas no detalhe do álbum arrastando a alça no lado direito da linha; a posição de destino é destacada durante o gesto e a numeração é salva nos metadados. Disponível quando a busca está limpa e para álbuns de um único disco.
 - Reprodução, pausa, faixa anterior/próxima, busca na biblioteca, barra de progresso e volume.
 - Modos de repetição: desligado, repetir fila e repetir faixa atual.
 - Editor de metadados: título, artista, álbum, artista do álbum, ano/data, número da faixa e gênero.

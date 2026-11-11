@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import mimetypes
 import os
+import random
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,7 +14,9 @@ from mutagen.flac import Picture
 from mutagen.id3 import APIC, TRCK
 from mutagen.mp4 import MP4Cover
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, QSettings, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import (
+    QEasingCurve, QEvent, QPoint, QPointF, QPropertyAnimation, QRectF, QSettings, QSize, Qt, QTimer, QUrl, Signal,
+)
 from PySide6.QtGui import (
     QAction,
     QBrush,
@@ -38,6 +41,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFrame,
+    QGraphicsOpacityEffect,
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
@@ -602,6 +606,23 @@ QFrame#playerBar { background: @surface; border-top: 1px solid @border; }
 QFrame#albumCard { background: @surface; border: 1px solid transparent; border-radius: 14px; }
 QFrame#albumCard:hover { background: @elevated; border-color: @border; }
 
+/* Tela "Tocando agora" */
+QLabel#npEyebrow { color: @text2; font-size: 11px; font-weight: 800; }
+QLabel#npTitle { font-size: 40px; font-weight: 800; }
+QLabel#npArtist { color: @text; font-size: 18px; font-weight: 600; }
+QLabel#npMeta { color: @text2; font-size: 13px; }
+QLabel#npTime { color: @text2; font-size: 12px; }
+QLabel#npSection { color: @text3; font-size: 10px; font-weight: 800; }
+QWidget#nowPlaying QSlider::groove:horizontal { height: 6px; border-radius: 3px; background: rgba(255,255,255,40); }
+QWidget#nowPlaying QSlider::sub-page:horizontal { border-radius: 3px; background: @accent; }
+QWidget#nowPlaying QSlider::add-page:horizontal { border-radius: 3px; background: rgba(255,255,255,40); }
+QWidget#nowPlaying QSlider::handle:horizontal { width: 14px; margin: -4px 0; border-radius: 7px; }
+QFrame#queueRow { background: transparent; border-radius: 10px; }
+QFrame#queueRow:hover { background: rgba(255,255,255,18); }
+QLabel#queueTitle { font-size: 13px; font-weight: 600; }
+QLabel#queueArtist { color: @text2; font-size: 12px; }
+QLabel#queueNumber { color: @text3; font-size: 12px; }
+
 /* Diálogos, menus e dicas */
 QDialog, QMessageBox { background: @surface; }
 QMessageBox QLabel { color: @text; }
@@ -815,6 +836,34 @@ def draw_icon(painter: QPainter, name: str, rect: QRectF, color: QColor) -> None
         painter.setPen(stroke)
         painter.setBrush(Qt.NoBrush)
         painter.drawPolyline(_poly((15, 5.5), (8.5, 12), (15, 18.5)))
+    elif name == "chevron-down":
+        painter.setPen(stroke)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawPolyline(_poly((5.5, 9), (12, 15.5), (18.5, 9)))
+    elif name == "shuffle":
+        painter.setPen(stroke)
+        painter.setBrush(Qt.NoBrush)
+        for y0, y1 in ((7, 17), (17, 7)):
+            path = QPainterPath()
+            path.moveTo(4, y0)
+            path.lineTo(7, y0)
+            path.cubicTo(12, y0, 12, y1, 17, y1)
+            painter.drawPath(path)
+        painter.setBrush(fill)
+        painter.setPen(_stroke(color, 1.2))
+        painter.drawPolygon(_poly((16.4, 4.2), (20.6, 7), (16.4, 9.8)))
+        painter.drawPolygon(_poly((16.4, 14.2), (20.6, 17), (16.4, 19.8)))
+    elif name in ("expand", "collapse"):
+        painter.setPen(stroke)
+        painter.setBrush(Qt.NoBrush)
+        if name == "expand":
+            corners = (((4, 9), (4, 4), (9, 4)), ((15, 4), (20, 4), (20, 9)),
+                       ((20, 15), (20, 20), (15, 20)), ((9, 20), (4, 20), (4, 15)))
+        else:
+            corners = (((9, 4), (9, 9), (4, 9)), ((15, 4), (15, 9), (20, 9)),
+                       ((20, 15), (15, 15), (15, 20)), ((4, 15), (9, 15), (9, 20)))
+        for points in corners:
+            painter.drawPolyline(_poly(*points))
     painter.restore()
 
 
@@ -1333,6 +1382,418 @@ ALBUM_MAX_WIDTH = 232
 GRID_GAP = 16
 SIDEBAR_WIDTH = 228
 DEFAULT_VOLUME = 72
+SEEK_STEP_MS = 5000
+VOLUME_STEP = 5
+
+
+# ---------- Tela "Tocando agora" ----------
+
+class ClickableLabel(QLabel):
+    clicked = Signal()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mousePressEvent(self, event):  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
+def blurred_background(data: Optional[bytes]) -> Optional[QPixmap]:
+    """Versão bem desfocada da capa, usada como fundo da tela Tocando agora."""
+    if not data:
+        return None
+    image = QImage.fromData(data)
+    if image.isNull():
+        return None
+    small = image.scaled(24, 24, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+    medium = small.scaled(96, 96, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+    return QPixmap.fromImage(medium.scaled(384, 384, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
+
+
+class QueueRow(QFrame):
+    """Linha clicável da lista "A seguir"."""
+
+    def __init__(self, track: Track, number: int, on_click: Callable, parent=None):
+        super().__init__(parent)
+        self.setObjectName("queueRow")
+        self.setAttribute(Qt.WA_Hover, True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip("Tocar agora")
+        self._on_click = on_click
+        row = QHBoxLayout(self)
+        row.setContentsMargins(8, 5, 12, 5)
+        row.setSpacing(12)
+        number_label = QLabel(str(number))
+        number_label.setObjectName("queueNumber")
+        number_label.setFixedWidth(18)
+        number_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        cover = QLabel()
+        cover.setFixedSize(40, 40)
+        cover.setPixmap(cover_or_placeholder(track.cover, 40, 6))
+        text = QVBoxLayout()
+        text.setSpacing(0)
+        title = ElidedLabel(track.title)
+        title.setObjectName("queueTitle")
+        artist = ElidedLabel(track.display_artist)
+        artist.setObjectName("queueArtist")
+        text.addWidget(title)
+        text.addWidget(artist)
+        duration = QLabel(format_time(track.duration))
+        duration.setObjectName("queueArtist")
+        row.addWidget(number_label)
+        row.addWidget(cover)
+        row.addLayout(text, 1)
+        row.addWidget(duration)
+
+    def mousePressEvent(self, event):  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            self._on_click()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
+class NowPlayingView(QWidget):
+    """Tela que ocupa a janela inteira: capa grande, tempo, controles e fila."""
+
+    QUEUE_ROW_HEIGHT = 52
+
+    def __init__(self, window: "SonoraWindow", parent: QWidget):
+        super().__init__(parent)
+        self.win = window
+        self.setObjectName("nowPlaying")
+        self.setFocusPolicy(Qt.StrongFocus)
+        self._track: Optional[Track] = None
+        self._background: Optional[QPixmap] = None
+        self._background_cache: Optional[tuple[QSize, QPixmap]] = None
+        self._cover_key: Optional[tuple] = None
+        self._seeking = False
+        self._shown_capacity = -1
+        self._build()
+        self._add_shortcuts()
+        self.hide()
+
+    # ----- Construção -----
+    def _build(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(40, 24, 40, 32)
+        outer.setSpacing(0)
+
+        top = QHBoxLayout()
+        self.close_button = IconButton("chevron-down", "Fechar (Esc)", 40, 26)
+        self.close_button.clicked.connect(self.win.close_now_playing)
+        eyebrow = QLabel("TOCANDO AGORA")
+        eyebrow.setObjectName("npEyebrow")
+        self.fullscreen_button = IconButton("expand", "Tela cheia (F11)", 40, 22)
+        self.fullscreen_button.clicked.connect(self.win.toggle_window_fullscreen)
+        top.addWidget(self.close_button)
+        top.addStretch(1)
+        top.addWidget(eyebrow)
+        top.addStretch(1)
+        top.addWidget(self.fullscreen_button)
+        outer.addLayout(top)
+        outer.addStretch(1)
+
+        body = QHBoxLayout()
+        body.setSpacing(56)
+        self.cover_label = QLabel()
+        self.cover_label.setAlignment(Qt.AlignCenter)
+        body.addStretch(1)
+        body.addWidget(self.cover_label, 0, Qt.AlignVCenter)
+
+        info = QWidget()
+        info.setMinimumWidth(340)
+        info.setMaximumWidth(600)
+        col = QVBoxLayout(info)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(0)
+
+        self.title_label = QLabel()
+        self.title_label.setObjectName("npTitle")
+        self.title_label.setWordWrap(True)
+        self.title_label.setTextFormat(Qt.PlainText)
+        self.artist_label = ElidedLabel()
+        self.artist_label.setObjectName("npArtist")
+        self.meta_label = ElidedLabel()
+        self.meta_label.setObjectName("npMeta")
+        col.addWidget(self.title_label)
+        col.addSpacing(8)
+        col.addWidget(self.artist_label)
+        col.addSpacing(4)
+        col.addWidget(self.meta_label)
+        col.addSpacing(30)
+
+        # Progresso
+        self.seek_slider = ClickableSlider(Qt.Horizontal)
+        self.seek_slider.setRange(0, 0)
+        self.seek_slider.setFocusPolicy(Qt.NoFocus)
+        self.seek_slider.setCursor(Qt.PointingHandCursor)
+        self.seek_slider.sliderPressed.connect(self._seek_pressed)
+        self.seek_slider.sliderReleased.connect(self._seek_released)
+        self.seek_slider.valueChanged.connect(self._seek_preview)
+        col.addWidget(self.seek_slider)
+        times = QHBoxLayout()
+        self.position_label = QLabel("00:00")
+        self.position_label.setObjectName("npTime")
+        self.remaining_label = QLabel("-00:00")
+        self.remaining_label.setObjectName("npTime")
+        self.duration_label = QLabel("00:00")
+        self.duration_label.setObjectName("npTime")
+        times.addWidget(self.position_label)
+        times.addStretch(1)
+        times.addWidget(self.remaining_label)
+        times.addStretch(1)
+        times.addWidget(self.duration_label)
+        col.addLayout(times)
+        col.addSpacing(16)
+
+        # Controles
+        controls = QHBoxLayout()
+        controls.setSpacing(18)
+        self.shuffle_button = IconButton("shuffle", "Aleatório: desligado", 44, 22)
+        self.previous_button = IconButton("prev", "Faixa anterior (Ctrl+←)", 48, 26)
+        self.play_button = IconButton("play", "Reproduzir (Espaço)", 68, 30, primary=True)
+        self.next_button = IconButton("next", "Próxima faixa (Ctrl+→)", 48, 26)
+        self.repeat_button = IconButton("repeat", "Repetição: desligada", 44, 22)
+        self.shuffle_button.clicked.connect(self.win.toggle_shuffle)
+        self.previous_button.clicked.connect(self.win.previous_track)
+        self.play_button.clicked.connect(self.win.toggle_playback)
+        self.next_button.clicked.connect(self.win.next_track)
+        self.repeat_button.clicked.connect(self.win.cycle_repeat)
+        controls.addStretch(1)
+        for button in (self.shuffle_button, self.previous_button, self.play_button,
+                       self.next_button, self.repeat_button):
+            controls.addWidget(button, 0, Qt.AlignVCenter)
+        controls.addStretch(1)
+        col.addLayout(controls)
+        col.addSpacing(18)
+
+        # Volume e ações
+        extras = QHBoxLayout()
+        extras.setSpacing(8)
+        self.volume_button = IconButton("volume-high", "Silenciar", 36, 20)
+        self.volume_button.clicked.connect(self.win.toggle_mute)
+        self.volume_slider = ClickableSlider(Qt.Horizontal)
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setFixedWidth(140)
+        self.volume_slider.setFocusPolicy(Qt.NoFocus)
+        self.volume_slider.setCursor(Qt.PointingHandCursor)
+        self.volume_slider.valueChanged.connect(self.win.volume_slider.setValue)
+        self.volume_label = QLabel("")
+        self.volume_label.setObjectName("npTime")
+        self.volume_label.setFixedWidth(38)
+        self.album_button = IconButton("albums", "Ir para o álbum", 36, 20)
+        self.album_button.clicked.connect(self.win.go_to_playing_album)
+        self.edit_button = IconButton("edit", "Editar metadados", 36, 20)
+        self.edit_button.clicked.connect(self._edit_current)
+        extras.addWidget(self.volume_button, 0, Qt.AlignVCenter)
+        extras.addWidget(self.volume_slider, 0, Qt.AlignVCenter)
+        extras.addWidget(self.volume_label, 0, Qt.AlignVCenter)
+        extras.addStretch(1)
+        extras.addWidget(self.album_button, 0, Qt.AlignVCenter)
+        extras.addWidget(self.edit_button, 0, Qt.AlignVCenter)
+        col.addLayout(extras)
+        col.addSpacing(24)
+
+        # Fila
+        self.queue_title = QLabel("A SEGUIR")
+        self.queue_title.setObjectName("npSection")
+        col.addWidget(self.queue_title)
+        col.addSpacing(6)
+        self.queue_host = QWidget()
+        self.queue_layout = QVBoxLayout(self.queue_host)
+        self.queue_layout.setContentsMargins(0, 0, 0, 0)
+        self.queue_layout.setSpacing(2)
+        col.addWidget(self.queue_host)
+
+        body.addWidget(info, 1, Qt.AlignVCenter)
+        body.addStretch(1)
+        outer.addLayout(body)
+        outer.addStretch(1)
+
+    def _add_shortcuts(self):
+        for sequence, handler in (
+            ("Esc", self.win.close_now_playing),
+            ("Left", lambda: self._seek_by(-SEEK_STEP_MS)),
+            ("Right", lambda: self._seek_by(SEEK_STEP_MS)),
+            ("Ctrl+Left", self.win.previous_track),
+            ("Ctrl+Right", self.win.next_track),
+            ("Up", lambda: self._volume_by(VOLUME_STEP)),
+            ("Down", lambda: self._volume_by(-VOLUME_STEP)),
+            ("S", self.win.toggle_shuffle),
+            ("R", self.win.cycle_repeat),
+            ("M", self.win.toggle_mute),
+        ):
+            action = QAction(self)
+            action.setShortcut(QKeySequence(sequence))
+            action.setShortcutContext(Qt.WidgetWithChildrenShortcut)
+            action.triggered.connect(handler)
+            self.addAction(action)
+
+    # ----- Sincronização com o player -----
+    def set_track(self, track: Optional[Track]):
+        self._track = track
+        if track is None:
+            self.title_label.setText("Nada tocando")
+            self.artist_label.setText("Escolha uma faixa da biblioteca")
+            self.meta_label.setText("")
+        else:
+            self.title_label.setText(track.title)
+            self.artist_label.setText(track.display_artist)
+            pieces = [track.display_album] + [p for p in (track.year, track.genre) if p]
+            self.meta_label.setText("  ·  ".join(pieces))
+        has_track = track is not None
+        for widget in (self.previous_button, self.next_button, self.seek_slider,
+                       self.album_button, self.edit_button):
+            widget.setEnabled(has_track)
+        self._background = blurred_background(track.cover if track else None)
+        self._background_cache = None
+        self._cover_key = None
+        self._update_cover()
+        self.refresh_queue()
+        self.update()
+
+    def set_position(self, position: int):
+        if not self._seeking:
+            self.seek_slider.blockSignals(True)
+            self.seek_slider.setValue(position)
+            self.seek_slider.blockSignals(False)
+            self._show_times(position)
+
+    def set_duration(self, duration: int):
+        self.seek_slider.setRange(0, max(0, duration))
+        self.duration_label.setText(format_time(duration / 1000))
+        self._show_times(self.seek_slider.value())
+
+    def set_playing(self, playing: bool):
+        self.play_button.set_icon_name("pause" if playing else "play")
+        self.play_button.setToolTip("Pausar (Espaço)" if playing else "Reproduzir (Espaço)")
+
+    def set_repeat(self, mode: int, tooltip: str):
+        self.repeat_button.set_active(mode != 0)
+        self.repeat_button.set_icon_name("repeat-one" if mode == 2 else "repeat")
+        self.repeat_button.setToolTip(tooltip + " (R)")
+        self.refresh_queue()
+
+    def set_shuffle(self, enabled: bool):
+        self.shuffle_button.set_active(enabled)
+        self.shuffle_button.setToolTip(f"Aleatório: {'ligado' if enabled else 'desligado'} (S)")
+        self.refresh_queue()
+
+    def set_volume(self, value: int, icon: str):
+        self.volume_slider.blockSignals(True)
+        self.volume_slider.setValue(value)
+        self.volume_slider.blockSignals(False)
+        self.volume_button.set_icon_name(icon)
+        self.volume_button.setToolTip(("Ativar som" if value == 0 else "Silenciar") + " (M)")
+        self.volume_label.setText(f"{value}%")
+
+    def set_fullscreen(self, fullscreen: bool):
+        self.fullscreen_button.set_icon_name("collapse" if fullscreen else "expand")
+        self.fullscreen_button.setToolTip("Sair da tela cheia (F11)" if fullscreen else "Tela cheia (F11)")
+
+    def refresh_queue(self):
+        while self.queue_layout.count():
+            item = self.queue_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        capacity = self._queue_capacity()
+        self._shown_capacity = capacity
+        queue, index = self.win.play_queue, self.win.queue_index
+        upcoming = queue[index + 1:index + 1 + capacity] if index >= 0 else []
+        if self.win.repeat_mode == 1 and len(upcoming) < capacity and index >= 0:
+            upcoming += queue[:min(capacity - len(upcoming), index)]
+        for number, track in enumerate(upcoming, start=1):
+            self.queue_layout.addWidget(QueueRow(track, number, lambda t=track: self._play_from_queue(t)))
+        visible = capacity > 0
+        self.queue_title.setVisible(visible)
+        self.queue_host.setVisible(visible)
+        if visible and not upcoming:
+            empty = QLabel("Fim da fila")
+            empty.setObjectName("npMeta")
+            self.queue_layout.addWidget(empty)
+
+    # ----- Ações -----
+    def _play_from_queue(self, track: Track):
+        self.win.play_track(track, keep_queue=True)
+
+    def _edit_current(self):
+        if self.win.current_track:
+            self.win.edit_track(self.win.current_track)
+
+    def _seek_pressed(self):
+        self._seeking = True
+
+    def _seek_released(self):
+        self.win.player.setPosition(self.seek_slider.value())
+        self._seeking = False
+
+    def _seek_preview(self, value: int):
+        if self._seeking:
+            self._show_times(value)
+
+    def _seek_by(self, delta: int):
+        if self._track is None:
+            return
+        duration = max(0, self.win.player.duration())
+        self.win.player.setPosition(max(0, min(duration, self.win.player.position() + delta)))
+
+    def _volume_by(self, delta: int):
+        slider = self.win.volume_slider
+        slider.setValue(max(0, min(100, slider.value() + delta)))
+
+    def _show_times(self, position: int):
+        self.position_label.setText(format_time(position / 1000))
+        remaining = max(0, self.seek_slider.maximum() - position)
+        self.remaining_label.setText(f"-{format_time(remaining / 1000)}")
+
+    # ----- Layout e pintura -----
+    def _queue_capacity(self) -> int:
+        free = self.height() - 600
+        return max(0, min(6, free // self.QUEUE_ROW_HEIGHT))
+
+    def _update_cover(self):
+        size = int(min(self.height() - 180, self.width() * 0.4, 680))
+        size = max(180, size)
+        key = (id(self._track), size)
+        if key == self._cover_key:
+            return
+        self._cover_key = key
+        cover = self._track.cover if self._track else None
+        self.cover_label.setFixedSize(size, size)
+        self.cover_label.setPixmap(cover_or_placeholder(cover, size, 18))
+
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        self._update_cover()
+        if self._queue_capacity() != self._shown_capacity:
+            self.refresh_queue()
+
+    def paintEvent(self, _event):  # noqa: N802
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), qcolor("bg"))
+        if self._background is not None:
+            if self._background_cache is None or self._background_cache[0] != self.size():
+                scaled = self._background.scaled(self.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+                self._background_cache = (self.size(), scaled)
+            scaled = self._background_cache[1]
+            painter.setOpacity(0.6)
+            painter.drawPixmap((self.width() - scaled.width()) // 2, (self.height() - scaled.height()) // 2, scaled)
+            painter.setOpacity(1.0)
+        else:
+            glow = QLinearGradient(0, 0, self.width(), self.height())
+            glow.setColorAt(0, qcolor("accent", 46))
+            glow.setColorAt(1, qcolor("bg", 0))
+            painter.fillRect(self.rect(), glow)
+        shade = QLinearGradient(0, 0, 0, self.height())
+        shade.setColorAt(0, qcolor("bg", 120))
+        shade.setColorAt(1, qcolor("bg", 225))
+        painter.fillRect(self.rect(), shade)
 
 
 class SonoraWindow(QMainWindow):
@@ -1351,6 +1812,10 @@ class SonoraWindow(QMainWindow):
         self.play_queue: list[Track] = []
         self.queue_index = -1
         self.repeat_mode = 0  # 0 = desligado, 1 = repetir fila, 2 = repetir faixa
+        self.shuffle = False
+        self._original_queue: list[Track] = []
+        self._fullscreen_by_view = False
+        self._was_maximized = False
         self._updating_seek = False
         self._last_volume = DEFAULT_VOLUME
         self.album_cards: list[AlbumCard] = []
@@ -1411,6 +1876,7 @@ class SonoraWindow(QMainWindow):
             self.pages.addWidget(page)
 
         self._build_player_bar(outer)
+        self.now_playing_view = NowPlayingView(self, root)
         self.toast = ToastLabel(root)
         self._toast_timer = QTimer(self)
         self._toast_timer.setSingleShot(True)
@@ -1721,9 +2187,11 @@ class SonoraWindow(QMainWindow):
         left_row = QHBoxLayout(left)
         left_row.setContentsMargins(0, 0, 0, 0)
         left_row.setSpacing(12)
-        self.player_cover = QLabel()
+        self.player_cover = ClickableLabel()
         self.player_cover.setFixedSize(56, 56)
         self.player_cover.setPixmap(placeholder_pixmap(56, 8))
+        self.player_cover.setToolTip("Abrir tela Tocando agora (F11)")
+        self.player_cover.clicked.connect(self.open_now_playing)
         left_row.addWidget(self.player_cover)
         text_col = QVBoxLayout()
         text_col.setSpacing(2)
@@ -1751,12 +2219,15 @@ class SonoraWindow(QMainWindow):
         self.play_button = IconButton("play", "Reproduzir (Espaço)", 44, 22, primary=True)
         self.next_button = IconButton("next", "Próxima faixa", 36, 20)
         self.repeat_button = IconButton("repeat", "Repetição: desligada", 36, 20)
+        self.shuffle_button = IconButton("shuffle", "Aleatório: desligado", 36, 20)
+        self.shuffle_button.clicked.connect(self.toggle_shuffle)
         self.previous_button.clicked.connect(self.previous_track)
         self.play_button.clicked.connect(self.toggle_playback)
         self.next_button.clicked.connect(self.next_track)
         self.repeat_button.clicked.connect(self.cycle_repeat)
         buttons.addStretch(1)
-        buttons.addSpacing(46)  # equilibra o botão de repetição e centraliza o Play
+        buttons.addWidget(self.shuffle_button, 0, Qt.AlignVCenter)
+        buttons.addSpacing(10)
         for button in (self.previous_button, self.play_button, self.next_button):
             buttons.addWidget(button, 0, Qt.AlignVCenter)
         buttons.addSpacing(10)
@@ -1804,6 +2275,10 @@ class SonoraWindow(QMainWindow):
         self.volume_label.setFixedWidth(34)
         self.volume_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         right_row.addStretch(1)
+        self.expand_button = IconButton("expand", "Tela Tocando agora (F11)", 32, 18)
+        self.expand_button.clicked.connect(self.open_now_playing)
+        right_row.addWidget(self.expand_button, 0, Qt.AlignVCenter)
+        right_row.addSpacing(6)
         right_row.addWidget(self.volume_button, 0, Qt.AlignVCenter)
         right_row.addWidget(self.volume_slider, 0, Qt.AlignVCenter)
         right_row.addWidget(self.volume_label, 0, Qt.AlignVCenter)
@@ -1817,6 +2292,8 @@ class SonoraWindow(QMainWindow):
             ("Ctrl+E", self.edit_selected_track),
             ("Space", self.toggle_playback),
             ("Ctrl+F", self.focus_search),
+            ("F11", self.toggle_now_playing_fullscreen),
+            ("Ctrl+P", self.toggle_now_playing),
         ):
             action = QAction(self)
             action.setShortcut(QKeySequence(sequence))
@@ -2173,8 +2650,106 @@ class SonoraWindow(QMainWindow):
 
     def resizeEvent(self, event):  # noqa: N802
         super().resizeEvent(event)
+        if hasattr(self, "now_playing_view"):
+            self.now_playing_view.setGeometry(self.centralWidget().rect())
         if hasattr(self, "toast"):
             self._place_toast()
+
+    def changeEvent(self, event):  # noqa: N802
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange and hasattr(self, "now_playing_view"):
+            self.now_playing_view.set_fullscreen(self.isFullScreen())
+
+    # ----- Tela "Tocando agora" -----
+    def open_now_playing(self):
+        view = self.now_playing_view
+        if view.isVisible():
+            return
+        view.setGeometry(self.centralWidget().rect())
+        view.set_track(self.current_track)
+        view.set_fullscreen(self.isFullScreen())
+        effect = QGraphicsOpacityEffect(view)
+        view.setGraphicsEffect(effect)
+        view.show()
+        view.raise_()
+        self.toast.raise_()
+        view.setFocus()
+        animation = QPropertyAnimation(effect, b"opacity", view)
+        animation.setDuration(220)
+        animation.setStartValue(0.0)
+        animation.setEndValue(1.0)
+        animation.setEasingCurve(QEasingCurve.OutCubic)
+        # remove o efeito no fim: pintar com efeito é mais lento
+        animation.finished.connect(lambda: view.setGraphicsEffect(None))
+        animation.start(QPropertyAnimation.DeleteWhenStopped)
+
+    def close_now_playing(self):
+        if self._fullscreen_by_view and self.isFullScreen():
+            self._exit_fullscreen()
+        self.now_playing_view.hide()
+        self.setFocus()
+
+    def toggle_now_playing(self):
+        if self.now_playing_view.isVisible():
+            self.close_now_playing()
+        else:
+            self.open_now_playing()
+
+    def toggle_now_playing_fullscreen(self):
+        """F11: abre a tela Tocando agora em tela cheia, ou alterna a tela cheia se já estiver aberta."""
+        if not self.now_playing_view.isVisible():
+            self.open_now_playing()
+            if not self.isFullScreen():
+                self._enter_fullscreen()
+        else:
+            self.toggle_window_fullscreen()
+
+    def toggle_window_fullscreen(self):
+        if self.isFullScreen():
+            self._exit_fullscreen()
+        else:
+            self._enter_fullscreen()
+
+    def _enter_fullscreen(self):
+        self._was_maximized = self.isMaximized()
+        self._fullscreen_by_view = True
+        self.showFullScreen()
+
+    def _exit_fullscreen(self):
+        self._fullscreen_by_view = False
+        if self._was_maximized:
+            self.showMaximized()
+        else:
+            self.showNormal()
+
+    def go_to_playing_album(self):
+        track = self.current_track
+        if not track:
+            return
+        album = next((a for a in self.albums if any(t.path == track.path for t in a["tracks"])), None)
+        self.close_now_playing()
+        if album:
+            self.open_album(album)
+
+    def toggle_shuffle(self):
+        self.shuffle = not self.shuffle
+        if self.current_track and self._original_queue:
+            if self.shuffle:
+                self.play_queue = self._shuffled_queue(self._original_queue, self.current_track)
+            else:
+                self.play_queue = list(self._original_queue)
+            self.queue_index = next(
+                (i for i, item in enumerate(self.play_queue) if item.path == self.current_track.path), -1
+            )
+        self.shuffle_button.set_active(self.shuffle)
+        self.shuffle_button.setToolTip(f"Aleatório: {'ligado' if self.shuffle else 'desligado'}")
+        self.now_playing_view.set_shuffle(self.shuffle)
+
+    @staticmethod
+    def _shuffled_queue(base: list[Track], current: Track) -> list[Track]:
+        rest = [t for t in base if t.path != current.path]
+        random.shuffle(rest)
+        return [current] + rest
 
     def _set_tracks_empty(self, show: bool, query: str):
         self.tracks_empty.setVisible(show)
@@ -2314,13 +2889,15 @@ class SonoraWindow(QMainWindow):
         self.notify("Metadados gravados no arquivo de música.")
 
     # ----- Reprodução -----
-    def play_track(self, track: Track, queue: Optional[list[Track]] = None):
-        self.play_queue = list(queue) if queue else list(self.all_tracks)
-        try:
-            self.queue_index = next(i for i, item in enumerate(self.play_queue) if item.path == track.path)
-        except StopIteration:
-            self.play_queue = list(self.all_tracks)
-            self.queue_index = next((i for i, item in enumerate(self.play_queue) if item.path == track.path), -1)
+    def play_track(self, track: Track, queue: Optional[list[Track]] = None, keep_queue: bool = False):
+        """Toca `track`. Com keep_queue=True, navega na fila atual (sem reembaralhar)."""
+        if not keep_queue or not self.play_queue:
+            base = list(queue) if queue else list(self.all_tracks)
+            if not any(item.path == track.path for item in base):
+                base = list(self.all_tracks)
+            self._original_queue = base
+            self.play_queue = self._shuffled_queue(base, track) if self.shuffle else list(base)
+        self.queue_index = next((i for i, item in enumerate(self.play_queue) if item.path == track.path), -1)
         self.current_track = track
         self.player.setSource(QUrl.fromLocalFile(track.path))
         self.player.play()
@@ -2332,6 +2909,7 @@ class SonoraWindow(QMainWindow):
         self.now_title.setText(track.title)
         self.now_artist.setText(track.display_artist)
         self.player_cover.setPixmap(cover_or_placeholder(track.cover, 56, 8))
+        self.now_playing_view.set_track(track)
 
     def _update_transport_state(self):
         has_track = self.current_track is not None
@@ -2352,6 +2930,7 @@ class SonoraWindow(QMainWindow):
         playing = state == QMediaPlayer.PlaybackState.PlayingState
         self.play_button.set_icon_name("pause" if playing else "play")
         self.play_button.setToolTip("Pausar (Espaço)" if playing else "Reproduzir (Espaço)")
+        self.now_playing_view.set_playing(playing)
 
     def next_track(self):
         if not self.play_queue or self.queue_index < 0:
@@ -2362,7 +2941,7 @@ class SonoraWindow(QMainWindow):
                 next_index = 0
             else:
                 return
-        self.play_track(self.play_queue[next_index], self.play_queue)
+        self.play_track(self.play_queue[next_index], keep_queue=True)
 
     def previous_track(self):
         if self.player.position() > 3000:
@@ -2377,7 +2956,7 @@ class SonoraWindow(QMainWindow):
             else:
                 self.player.setPosition(0)
                 return
-        self.play_track(self.play_queue[previous_index], self.play_queue)
+        self.play_track(self.play_queue[previous_index], keep_queue=True)
 
     def play_current_album(self):
         if self.current_album and self.current_album["tracks"]:
@@ -2389,6 +2968,7 @@ class SonoraWindow(QMainWindow):
         self.repeat_button.setToolTip(f"Repetição: {names[self.repeat_mode]} (clique para alternar)")
         self.repeat_button.set_active(self.repeat_mode != 0)
         self.repeat_button.set_icon_name("repeat-one" if self.repeat_mode == 2 else "repeat")
+        self.now_playing_view.set_repeat(self.repeat_mode, f"Repetição: {names[self.repeat_mode]}")
 
     def handle_media_status(self, status):
         if status == QMediaPlayer.MediaStatus.EndOfMedia:
@@ -2398,7 +2978,7 @@ class SonoraWindow(QMainWindow):
             elif self.queue_index + 1 < len(self.play_queue):
                 self.next_track()
             elif self.repeat_mode == 1 and self.play_queue:
-                self.play_track(self.play_queue[0], self.play_queue)
+                self.play_track(self.play_queue[0], keep_queue=True)
             else:
                 self.update_play_button(QMediaPlayer.PlaybackState.StoppedState)
 
@@ -2419,10 +2999,12 @@ class SonoraWindow(QMainWindow):
         if not self._updating_seek:
             self.seek_slider.setValue(position)
         self.position_label.setText(format_time(position / 1000))
+        self.now_playing_view.set_position(position)
 
     def update_duration(self, duration: int):
         self.seek_slider.setRange(0, max(0, duration))
         self.duration_label.setText(format_time(duration / 1000))
+        self.now_playing_view.set_duration(duration)
 
     def change_volume(self, value: int):
         self.audio_output.setVolume(value / 100)
@@ -2442,6 +3024,8 @@ class SonoraWindow(QMainWindow):
         self.volume_button.setToolTip("Ativar som" if value == 0 else "Silenciar")
         self.volume_slider.setToolTip(f"Volume: {value}%")
         self.volume_label.setText(f"{value}%")
+        if hasattr(self, "now_playing_view"):
+            self.now_playing_view.set_volume(value, icon)
 
 
 def main():

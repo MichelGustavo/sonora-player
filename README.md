@@ -11,9 +11,12 @@ Player de música desktop em Python, com interface escura e minimalista.
 - Reordenação de faixas no detalhe do álbum arrastando a alça no lado direito da linha; a posição de destino é destacada durante o gesto e a numeração é salva nos metadados. Disponível quando a busca está limpa e para álbuns de um único disco.
 - Reprodução, pausa, faixa anterior/próxima, busca na biblioteca, barra de progresso e volume.
 - Modos de repetição: desligado, repetir fila e repetir faixa atual.
+- Modo aleatório, que embaralha a fila mantendo a faixa atual (desligar restaura a ordem original).
+- Tela **Tocando agora** ocupando a janela inteira: capa grande sobre fundo desfocado, título, artista, álbum, ano e gênero, progresso com tempo decorrido/restante/total, controles, volume, atalhos para ir ao álbum e editar metadados, e a lista **A seguir** com as próximas faixas (clique para tocar).
 - Editor de metadados: título, artista, álbum, artista do álbum, ano/data, número da faixa e gênero.
 - Opção de incorporar uma nova capa ao arquivo (formatos compatíveis).
-- Atalhos: `Ctrl+O` abre pasta, `Ctrl+E` edita a faixa selecionada, `Ctrl+F` foca a busca e `Espaço` reproduz/pausa.
+- Atalhos: `Ctrl+O` abre pasta, `Ctrl+E` edita a faixa selecionada, `Ctrl+F` foca a busca, `Espaço` reproduz/pausa, `Ctrl+P` abre/fecha a tela Tocando agora e `F11` a abre em tela cheia.
+  Na tela Tocando agora: `Esc` fecha, `←`/`→` avançam ou voltam 5 s, `Ctrl+←`/`Ctrl+→` trocam de faixa, `↑`/`↓` ajustam o volume, `M` silencia, `S` alterna o aleatório e `R` a repetição.
 - Última pasta selecionada salva nas configurações do aplicativo.
 
 ## Interface

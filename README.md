@@ -61,6 +61,26 @@ python -m pip install -r requirements.txt
 python app.py
 ```
 
+### Executável Linux (CachyOS)
+
+No CachyOS, gere uma pasta portátil com o binário do SONORA:
+
+```bash
+chmod +x build_linux.sh
+./build_linux.sh
+```
+
+O executável será criado em `dist/SONORA/SONORA`, e o pacote portátil será
+`dist/SONORA-linux-x86_64.tar.gz`. Extraia o pacote e inicie com:
+
+```bash
+tar -xzf dist/SONORA-linux-x86_64.tar.gz
+./SONORA/SONORA
+```
+
+O primeiro build instala PyInstaller e as dependências Python no ambiente local `.venv`.
+O pacote deve ser construído em Linux e para a mesma arquitetura do sistema de destino.
+
 ## Formatos
 
 A biblioteca reconhece arquivos com extensão MP3, FLAC, WAV, M4A, AAC, OGG, OPUS, WMA, AIFF e MP4. A reprodução depende dos codecs disponíveis no backend multimídia do Qt e do sistema operacional; por isso, a disponibilidade efetiva pode variar entre Windows, macOS e Linux.

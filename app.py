@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import mimetypes
 import os
 import random
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
+
+# Identifica o aplicativo para o PipeWire / PulseAudio antes de iniciar o QtMultimedia.
+os.environ.setdefault("PULSE_PROP_application.name", "SONORA")
+os.environ.setdefault("PULSE_PROP_application.icon_name", "sonora")
+os.environ.setdefault("PULSE_PROP_media.role", "music")
 
 from mutagen import File as MutagenFile
 from mutagen.flac import Picture
@@ -62,6 +69,18 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+
+try:
+    from PySide6.QtDBus import (
+        QDBusConnection,
+        QDBusMessage,
+        QDBusObjectPath,
+        QDBusVariant,
+        QDBusVirtualObject,
+    )
+    HAS_DBUS = True
+except ImportError:
+    HAS_DBUS = False
 
 
 APP_NAME = "SONORA"
@@ -1730,8 +1749,11 @@ class NowPlayingView(QWidget):
         self._seeking = True
 
     def _seek_released(self):
-        self.win.player.setPosition(self.seek_slider.value())
+        pos = self.seek_slider.value()
+        self.win.player.setPosition(pos)
         self._seeking = False
+        if hasattr(self.win, "mpris") and self.win.mpris:
+            self.win.mpris.emit_seeked(pos)
 
     def _seek_preview(self, value: int):
         if self._seeking:
@@ -1741,7 +1763,10 @@ class NowPlayingView(QWidget):
         if self._track is None:
             return
         duration = max(0, self.win.player.duration())
-        self.win.player.setPosition(max(0, min(duration, self.win.player.position() + delta)))
+        pos = max(0, min(duration, self.win.player.position() + delta))
+        self.win.player.setPosition(pos)
+        if hasattr(self.win, "mpris") and self.win.mpris:
+            self.win.mpris.emit_seeked(pos)
 
     def _volume_by(self, delta: int):
         slider = self.win.volume_slider
@@ -1796,6 +1821,347 @@ class NowPlayingView(QWidget):
         painter.fillRect(self.rect(), shade)
 
 
+# ---------- Integração MPRIS2 (barra de tarefas / controles de mídia do sistema) ----------
+
+MPRIS_PATH = "/org/mpris/MediaPlayer2"
+MPRIS_ROOT_IFACE = "org.mpris.MediaPlayer2"
+MPRIS_PLAYER_IFACE = "org.mpris.MediaPlayer2.Player"
+DBUS_PROPS_IFACE = "org.freedesktop.DBus.Properties"
+
+MPRIS_INTROSPECT_XML = """
+<interface name="org.mpris.MediaPlayer2">
+  <method name="Raise"/>
+  <method name="Quit"/>
+  <property name="CanQuit" type="b" access="read"/>
+  <property name="CanRaise" type="b" access="read"/>
+  <property name="CanSetFullscreen" type="b" access="read"/>
+  <property name="Fullscreen" type="b" access="readwrite"/>
+  <property name="HasTrackList" type="b" access="read"/>
+  <property name="Identity" type="s" access="read"/>
+  <property name="DesktopEntry" type="s" access="read"/>
+  <property name="SupportedUriSchemes" type="as" access="read"/>
+  <property name="SupportedMimeTypes" type="as" access="read"/>
+</interface>
+<interface name="org.mpris.MediaPlayer2.Player">
+  <method name="Next"/>
+  <method name="Previous"/>
+  <method name="Pause"/>
+  <method name="PlayPause"/>
+  <method name="Stop"/>
+  <method name="Play"/>
+  <method name="Seek"><arg direction="in" name="Offset" type="x"/></method>
+  <method name="SetPosition">
+    <arg direction="in" name="TrackId" type="o"/>
+    <arg direction="in" name="Position" type="x"/>
+  </method>
+  <method name="OpenUri"><arg direction="in" name="Uri" type="s"/></method>
+  <signal name="Seeked"><arg name="Position" type="x"/></signal>
+  <property name="PlaybackStatus" type="s" access="read"/>
+  <property name="LoopStatus" type="s" access="readwrite"/>
+  <property name="Rate" type="d" access="readwrite"/>
+  <property name="Shuffle" type="b" access="readwrite"/>
+  <property name="Metadata" type="a{sv}" access="read"/>
+  <property name="Volume" type="d" access="readwrite"/>
+  <property name="Position" type="x" access="read"/>
+  <property name="MinimumRate" type="d" access="read"/>
+  <property name="MaximumRate" type="d" access="read"/>
+  <property name="CanGoNext" type="b" access="read"/>
+  <property name="CanGoPrevious" type="b" access="read"/>
+  <property name="CanPlay" type="b" access="read"/>
+  <property name="CanPause" type="b" access="read"/>
+  <property name="CanSeek" type="b" access="read"/>
+  <property name="CanControl" type="b" access="read"/>
+</interface>
+"""
+
+
+def _ensure_linux_desktop_integration() -> None:
+    """Registra ícone e atalho .desktop do SONORA para que o painel de áudio/mídia exiba nome e ícone."""
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        data_home = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share"))
+        icon_dir = data_home / "icons" / "hicolor" / "128x128" / "apps"
+        icon_dir.mkdir(parents=True, exist_ok=True)
+        icon_path = icon_dir / "sonora.png"
+        if not icon_path.exists():
+            brand_pixmap(128).save(str(icon_path), "PNG")
+        app_dir = data_home / "applications"
+        app_dir.mkdir(parents=True, exist_ok=True)
+        desktop_path = app_dir / "sonora.desktop"
+        if not desktop_path.exists():
+            desktop_path.write_text(
+                "[Desktop Entry]\n"
+                "Type=Application\n"
+                "Name=SONORA\n"
+                "Comment=Music Library & Player\n"
+                f"Icon={icon_path}\n"
+                "Categories=AudioVideo;Audio;Player;\n"
+                "StartupWMClass=sonora\n"
+                "NoDisplay=true\n",
+                encoding="utf-8",
+            )
+    except Exception:
+        pass
+
+
+if HAS_DBUS:
+    class MprisService(QDBusVirtualObject):
+        """Exporta o estado e controles de reprodução via D-Bus (especificação MPRIS2)."""
+
+        def __init__(self, window: "SonoraWindow"):
+            super().__init__(window)
+            self.win = window
+            self.bus = QDBusConnection.sessionBus()
+            self._cover_cache: dict[str, str] = {}
+            self.active = False
+            if not self.bus.isConnected():
+                return
+            service = "org.mpris.MediaPlayer2.sonora"
+            if not self.bus.registerService(service):
+                service = f"{service}.instance{os.getpid()}"
+                if not self.bus.registerService(service):
+                    return
+            self.active = self.bus.registerVirtualObject(MPRIS_PATH, self)
+
+        def introspect(self, _path: str) -> str:
+            return MPRIS_INTROSPECT_XML
+
+        def _cover_art_url(self, cover: Optional[bytes]) -> str:
+            if not cover:
+                return ""
+            digest = hashlib.sha1(cover).hexdigest()[:12]
+            cached = self._cover_cache.get(digest)
+            if cached and Path(cached).exists():
+                return QUrl.fromLocalFile(cached).toString()
+            image = QImage.fromData(cover)
+            if image.isNull():
+                return ""
+            target = Path(tempfile.gettempdir()) / f"sonora-cover-{digest}.png"
+            if not target.exists():
+                image.save(str(target), "PNG")
+            self._cover_cache[digest] = str(target)
+            return QUrl.fromLocalFile(str(target)).toString()
+
+        def _track_object_path(self, track: Optional[Track]) -> QDBusObjectPath:
+            if track is None:
+                return QDBusObjectPath("/org/mpris/MediaPlayer2/TrackList/NoTrack")
+            digest = hashlib.sha1(track.path.encode("utf-8", errors="ignore")).hexdigest()[:16]
+            return QDBusObjectPath(f"/org/mpris/MediaPlayer2/Track/t_{digest}")
+
+        def _metadata(self) -> dict:
+            track = self.win.current_track
+            if track is None:
+                return {"mpris:trackid": self._track_object_path(None)}
+            duration_ms = self.win.player.duration()
+            if duration_ms <= 0:
+                duration_ms = int(max(0.0, track.duration) * 1000)
+            meta = {
+                "mpris:trackid": self._track_object_path(track),
+                "mpris:length": int(max(0, duration_ms) * 1000),
+                "xesam:title": track.title or Path(track.path).stem,
+                "xesam:artist": [track.display_artist],
+                "xesam:album": track.display_album,
+                "xesam:albumArtist": [track.album_artist or track.display_artist],
+                "xesam:url": QUrl.fromLocalFile(track.path).toString(),
+            }
+            if track.genre:
+                meta["xesam:genre"] = [track.genre]
+            art_url = self._cover_art_url(track.cover)
+            if art_url:
+                meta["mpris:artUrl"] = art_url
+            return meta
+
+        def _playback_status(self) -> str:
+            state = self.win.player.playbackState()
+            if state == QMediaPlayer.PlaybackState.PlayingState:
+                return "Playing"
+            if state == QMediaPlayer.PlaybackState.PausedState:
+                return "Paused"
+            return "Stopped"
+
+        def _loop_status(self) -> str:
+            return ("None", "Playlist", "Track")[self.win.repeat_mode % 3]
+
+        def _root_properties(self) -> dict:
+            return {
+                "CanQuit": True,
+                "CanRaise": True,
+                "CanSetFullscreen": True,
+                "Fullscreen": bool(self.win.isFullScreen()),
+                "HasTrackList": False,
+                "Identity": APP_NAME,
+                "DesktopEntry": "sonora",
+                "SupportedUriSchemes": ["file"],
+                "SupportedMimeTypes": [
+                    "audio/mpeg", "audio/flac", "audio/wav", "audio/mp4",
+                    "audio/aac", "audio/ogg", "audio/opus", "audio/x-ms-wma", "audio/aiff",
+                ],
+            }
+
+        def _player_properties(self) -> dict:
+            has_track = self.win.current_track is not None
+            has_queue = has_track and len(self.win.play_queue) > 0
+            return {
+                "PlaybackStatus": self._playback_status(),
+                "LoopStatus": self._loop_status(),
+                "Rate": 1.0,
+                "MinimumRate": 1.0,
+                "MaximumRate": 1.0,
+                "Shuffle": bool(self.win.shuffle),
+                "Metadata": self._metadata(),
+                "Volume": round(self.win.volume_slider.value() / 100.0, 4),
+                "Position": int(max(0, self.win.player.position()) * 1000),
+                "CanGoNext": bool(has_queue),
+                "CanGoPrevious": bool(has_queue),
+                "CanPlay": bool(has_track or len(self.win.all_tracks) > 0),
+                "CanPause": bool(has_track),
+                "CanSeek": bool(has_track),
+                "CanControl": True,
+            }
+
+        def _emit_properties_changed(self, iface: str, changed: dict) -> None:
+            if not self.active or not changed:
+                return
+            sig = QDBusMessage.createSignal(MPRIS_PATH, DBUS_PROPS_IFACE, "PropertiesChanged")
+            # Nota: o 3º argumento precisa ser uma lista de strings não vazia para o PySide6
+            # serializar como 'as' (QStringList) em vez de 'av' (QVariantList).
+            sig.setArguments([iface, changed, ["MinimumRate"]])
+            self.bus.send(sig)
+
+        def notify_track(self) -> None:
+            props = self._player_properties()
+            self._emit_properties_changed(MPRIS_PLAYER_IFACE, {
+                "Metadata": props["Metadata"],
+                "PlaybackStatus": props["PlaybackStatus"],
+                "CanPlay": props["CanPlay"],
+                "CanPause": props["CanPause"],
+                "CanSeek": props["CanSeek"],
+                "CanGoNext": props["CanGoNext"],
+                "CanGoPrevious": props["CanGoPrevious"],
+            })
+
+        def notify_duration(self) -> None:
+            if self.win.current_track is not None:
+                self._emit_properties_changed(MPRIS_PLAYER_IFACE, {"Metadata": self._metadata()})
+
+        def notify_playback(self) -> None:
+            props = self._player_properties()
+            self._emit_properties_changed(MPRIS_PLAYER_IFACE, {
+                "PlaybackStatus": props["PlaybackStatus"],
+                "CanPlay": props["CanPlay"],
+                "CanPause": props["CanPause"],
+            })
+
+        def notify_repeat(self) -> None:
+            self._emit_properties_changed(MPRIS_PLAYER_IFACE, {"LoopStatus": self._loop_status()})
+
+        def notify_shuffle(self) -> None:
+            self._emit_properties_changed(MPRIS_PLAYER_IFACE, {"Shuffle": bool(self.win.shuffle)})
+
+        def notify_volume(self) -> None:
+            self._emit_properties_changed(
+                MPRIS_PLAYER_IFACE,
+                {"Volume": round(self.win.volume_slider.value() / 100.0, 4)},
+            )
+
+        def emit_seeked(self, position_ms: int) -> None:
+            if not self.active:
+                return
+            sig = QDBusMessage.createSignal(MPRIS_PATH, MPRIS_PLAYER_IFACE, "Seeked")
+            sig.setArguments([int(max(0, position_ms) * 1000)])
+            self.bus.send(sig)
+
+        def handleMessage(self, message: QDBusMessage, connection: QDBusConnection) -> bool:  # noqa: N802
+            iface = message.interface()
+            member = message.member()
+            args = message.arguments()
+
+            if iface == DBUS_PROPS_IFACE:
+                if member == "GetAll":
+                    target = args[0] if args else ""
+                    props = self._root_properties() if target == MPRIS_ROOT_IFACE else self._player_properties()
+                    connection.send(message.createReply(props))
+                    return True
+                if member == "Get":
+                    target = args[0] if len(args) > 0 else ""
+                    prop = args[1] if len(args) > 1 else ""
+                    props = self._root_properties() if target == MPRIS_ROOT_IFACE else self._player_properties()
+                    if prop in props:
+                        connection.send(message.createReply(QDBusVariant(props[prop])))
+                        return True
+                    return False
+                if member == "Set" and len(args) >= 3:
+                    prop = args[1]
+                    raw = args[2]
+                    val = raw.variant() if isinstance(raw, QDBusVariant) else raw
+                    if prop == "Volume":
+                        self.win.volume_slider.setValue(max(0, min(100, round(float(val) * 100))))
+                    elif prop == "Shuffle":
+                        if bool(val) != self.win.shuffle:
+                            self.win.toggle_shuffle()
+                    elif prop == "LoopStatus":
+                        mapping = {"None": 0, "Playlist": 1, "Track": 2}
+                        if val in mapping:
+                            self.win.set_repeat_mode(mapping[val])
+                    elif prop == "Fullscreen":
+                        if bool(val) != self.win.isFullScreen():
+                            self.win.toggle_window_fullscreen()
+                    connection.send(message.createReply())
+                    return True
+                return False
+
+            if iface == MPRIS_ROOT_IFACE:
+                if member == "Raise":
+                    self.win.showNormal() if self.win.isMinimized() else None
+                    self.win.raise_()
+                    self.win.activateWindow()
+                    connection.send(message.createReply())
+                    return True
+                if member == "Quit":
+                    connection.send(message.createReply())
+                    QApplication.quit()
+                    return True
+                return False
+
+            if iface == MPRIS_PLAYER_IFACE:
+                if member == "PlayPause":
+                    self.win.toggle_playback()
+                elif member == "Play":
+                    if self.win.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+                        self.win.toggle_playback()
+                elif member == "Pause":
+                    self.win.player.pause()
+                elif member == "Stop":
+                    self.win.player.stop()
+                elif member == "Next":
+                    self.win.next_track()
+                elif member == "Previous":
+                    self.win.previous_track()
+                elif member == "Seek" and args:
+                    offset_ms = int(args[0]) // 1000
+                    dur = max(0, self.win.player.duration())
+                    pos = max(0, min(dur, self.win.player.position() + offset_ms))
+                    self.win.player.setPosition(pos)
+                    self.emit_seeked(pos)
+                elif member == "SetPosition" and len(args) >= 2:
+                    pos = max(0, min(max(0, self.win.player.duration()), int(args[1]) // 1000))
+                    self.win.player.setPosition(pos)
+                    self.emit_seeked(pos)
+                elif member == "OpenUri" and args:
+                    local = QUrl(str(args[0])).toLocalFile()
+                    if local:
+                        match = next((t for t in self.win.all_tracks if t.path == local), None)
+                        if match:
+                            self.win.play_track(match, self.win.all_tracks)
+                else:
+                    return False
+                connection.send(message.createReply())
+                return True
+
+            return False
+
+
 class SonoraWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1834,6 +2200,7 @@ class SonoraWindow(QMainWindow):
 
         self._build_ui()
         self._add_shortcuts()
+        self.mpris = MprisService(self) if HAS_DBUS else None
         self._set_volume_label(DEFAULT_VOLUME)
         self._update_transport_state()
         saved_folder = self.settings.value("library_folder", "")
@@ -2744,6 +3111,8 @@ class SonoraWindow(QMainWindow):
         self.shuffle_button.set_active(self.shuffle)
         self.shuffle_button.setToolTip(f"Aleatório: {'ligado' if self.shuffle else 'desligado'}")
         self.now_playing_view.set_shuffle(self.shuffle)
+        if self.mpris:
+            self.mpris.notify_shuffle()
 
     @staticmethod
     def _shuffled_queue(base: list[Track], current: Track) -> list[Track]:
@@ -2910,6 +3279,8 @@ class SonoraWindow(QMainWindow):
         self.now_artist.setText(track.display_artist)
         self.player_cover.setPixmap(cover_or_placeholder(track.cover, 56, 8))
         self.now_playing_view.set_track(track)
+        if self.mpris:
+            self.mpris.notify_track()
 
     def _update_transport_state(self):
         has_track = self.current_track is not None
@@ -2917,6 +3288,8 @@ class SonoraWindow(QMainWindow):
         self.next_button.setEnabled(has_track)
         self.seek_slider.setEnabled(has_track)
         self.play_button.setEnabled(has_track or bool(self.all_tracks))
+        if self.mpris:
+            self.mpris.notify_playback()
 
     def toggle_playback(self):
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
@@ -2931,6 +3304,8 @@ class SonoraWindow(QMainWindow):
         self.play_button.set_icon_name("pause" if playing else "play")
         self.play_button.setToolTip("Pausar (Espaço)" if playing else "Reproduzir (Espaço)")
         self.now_playing_view.set_playing(playing)
+        if self.mpris:
+            self.mpris.notify_playback()
 
     def next_track(self):
         if not self.play_queue or self.queue_index < 0:
@@ -2946,6 +3321,8 @@ class SonoraWindow(QMainWindow):
     def previous_track(self):
         if self.player.position() > 3000:
             self.player.setPosition(0)
+            if self.mpris:
+                self.mpris.emit_seeked(0)
             return
         if not self.play_queue or self.queue_index < 0:
             return
@@ -2955,6 +3332,8 @@ class SonoraWindow(QMainWindow):
                 previous_index = len(self.play_queue) - 1
             else:
                 self.player.setPosition(0)
+                if self.mpris:
+                    self.mpris.emit_seeked(0)
                 return
         self.play_track(self.play_queue[previous_index], keep_queue=True)
 
@@ -2963,12 +3342,17 @@ class SonoraWindow(QMainWindow):
             self.play_track(self.current_album["tracks"][0], self.current_album["tracks"])
 
     def cycle_repeat(self):
-        self.repeat_mode = (self.repeat_mode + 1) % 3
+        self.set_repeat_mode((self.repeat_mode + 1) % 3)
+
+    def set_repeat_mode(self, mode: int):
+        self.repeat_mode = mode % 3
         names = ["desligada", "repetir fila", "repetir faixa atual"]
         self.repeat_button.setToolTip(f"Repetição: {names[self.repeat_mode]} (clique para alternar)")
         self.repeat_button.set_active(self.repeat_mode != 0)
         self.repeat_button.set_icon_name("repeat-one" if self.repeat_mode == 2 else "repeat")
         self.now_playing_view.set_repeat(self.repeat_mode, f"Repetição: {names[self.repeat_mode]}")
+        if self.mpris:
+            self.mpris.notify_repeat()
 
     def handle_media_status(self, status):
         if status == QMediaPlayer.MediaStatus.EndOfMedia:
@@ -2992,8 +3376,11 @@ class SonoraWindow(QMainWindow):
         self._updating_seek = True
 
     def _seek_released(self):
-        self.player.setPosition(self.seek_slider.value())
+        pos = self.seek_slider.value()
+        self.player.setPosition(pos)
         self._updating_seek = False
+        if self.mpris:
+            self.mpris.emit_seeked(pos)
 
     def update_position(self, position: int):
         if not self._updating_seek:
@@ -3005,12 +3392,16 @@ class SonoraWindow(QMainWindow):
         self.seek_slider.setRange(0, max(0, duration))
         self.duration_label.setText(format_time(duration / 1000))
         self.now_playing_view.set_duration(duration)
+        if self.mpris:
+            self.mpris.notify_duration()
 
     def change_volume(self, value: int):
         self.audio_output.setVolume(value / 100)
         if value > 0:
             self._last_volume = value
         self._set_volume_label(value)
+        if self.mpris:
+            self.mpris.notify_volume()
 
     def toggle_mute(self):
         if self.volume_slider.value() > 0:
@@ -3031,7 +3422,10 @@ class SonoraWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
+    app.setApplicationDisplayName(APP_NAME)
     app.setOrganizationName("SonoraStudio")
+    app.setDesktopFileName("sonora")
+    _ensure_linux_desktop_integration()
     app.setStyle("Fusion")
     app.setPalette(build_palette())
     app.setStyleSheet(build_stylesheet())

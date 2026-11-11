@@ -487,16 +487,18 @@ PALETTE = {
     "hover": "#30303B",
     "selected": "#2B2B37",
     "border": "#26262F",
-    "borderStrong": "#3A3A47",
-    "track": "#3A3A47",
+    "borderStrong": "#746B5E",
+    "track": "#746B5E",
     "text": "#F3F3F6",
     "text2": "#A3A4B2",
-    "text3": "#6E6F7E",
-    "accent": "#FF7A45",
-    "accentHover": "#FF9262",
-    "accentPress": "#E8672F",
-    "onAccent": "#1A0D07",
-    "danger": "#FF6B7A",
+    "text3": "#746B5E",
+    "accent": "#D55123",
+    "accentHover": "#E47A24",
+    "accentPress": "#BF2C20",
+    "accentDeep": "#951A21",
+    "accentMuted": "#746B5E",
+    "onAccent": "#FAF6F2",
+    "danger": "#BF2C20",
 }
 
 STYLESHEET_TEMPLATE = """
@@ -613,7 +615,10 @@ QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
 /* Sliders */
 QSlider { min-height: 16px; }
 QSlider::groove:horizontal { height: 4px; background: @track; border-radius: 2px; }
-QSlider::sub-page:horizontal { background: @accent; border-radius: 2px; }
+QSlider::sub-page:horizontal {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 @accentDeep, stop:0.5 @accentPress, stop:1 @accentHover);
+    border-radius: 2px;
+}
 QSlider::add-page:horizontal { background: @track; border-radius: 2px; }
 QSlider::handle:horizontal { background: @text; width: 12px; margin: -4px 0; border-radius: 6px; }
 QSlider::handle:horizontal:hover { background: #FFFFFF; }
@@ -632,9 +637,12 @@ QLabel#npArtist { color: @text; font-size: 18px; font-weight: 600; }
 QLabel#npMeta { color: @text2; font-size: 13px; }
 QLabel#npTime { color: @text2; font-size: 12px; }
 QLabel#npSection { color: @text3; font-size: 10px; font-weight: 800; }
-QWidget#nowPlaying QSlider::groove:horizontal { height: 6px; border-radius: 3px; background: rgba(255,255,255,40); }
-QWidget#nowPlaying QSlider::sub-page:horizontal { border-radius: 3px; background: @accent; }
-QWidget#nowPlaying QSlider::add-page:horizontal { border-radius: 3px; background: rgba(255,255,255,40); }
+QWidget#nowPlaying QSlider::groove:horizontal { height: 6px; border-radius: 3px; background: rgba(116,107,94,95); }
+QWidget#nowPlaying QSlider::sub-page:horizontal {
+    border-radius: 3px;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 @accentDeep, stop:0.45 @accentPress, stop:0.78 @accent, stop:1 @accentHover);
+}
+QWidget#nowPlaying QSlider::add-page:horizontal { border-radius: 3px; background: rgba(116,107,94,95); }
 QWidget#nowPlaying QSlider::handle:horizontal { width: 14px; margin: -4px 0; border-radius: 7px; }
 QFrame#queueRow { background: transparent; border-radius: 10px; }
 QFrame#queueRow:hover { background: rgba(255,255,255,18); }
@@ -901,7 +909,9 @@ def brand_pixmap(size: int) -> QPixmap:
     painter.setPen(Qt.NoPen)
     gradient = QLinearGradient(0, 0, size, size)
     gradient.setColorAt(0, qcolor("accentHover"))
-    gradient.setColorAt(1, qcolor("accentPress"))
+    gradient.setColorAt(0.38, qcolor("accent"))
+    gradient.setColorAt(0.72, qcolor("accentPress"))
+    gradient.setColorAt(1, qcolor("accentDeep"))
     painter.setBrush(QBrush(gradient))
     painter.drawRoundedRect(QRectF(0, 0, size, size), size * 0.28, size * 0.28)
     painter.setBrush(qcolor("onAccent"))
@@ -1812,7 +1822,8 @@ class NowPlayingView(QWidget):
             painter.setOpacity(1.0)
         else:
             glow = QLinearGradient(0, 0, self.width(), self.height())
-            glow.setColorAt(0, qcolor("accent", 46))
+            glow.setColorAt(0, qcolor("accentDeep", 90))
+            glow.setColorAt(0.45, qcolor("accent", 50))
             glow.setColorAt(1, qcolor("bg", 0))
             painter.fillRect(self.rect(), glow)
         shade = QLinearGradient(0, 0, 0, self.height())
